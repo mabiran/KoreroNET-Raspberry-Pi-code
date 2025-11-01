@@ -1,0 +1,9 @@
+
+pyserial
+tk
+numpy
+torch
+torchvision
+librosa
+soundfile
+birdnet-analyzer
