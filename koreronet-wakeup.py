@@ -27,8 +27,8 @@ DRIVE_DIR = Path(CHECK_PATH)
 RCLONE = "rclone"
 RCLONE_REMOTE = "gdrive"  # remote name
 MOUNT_POINT = Path("/mnt/gdrive")
-IMPORT_DIR = MOUNT_POINT / "To the node"
-EXPORT_DIR = MOUNT_POINT / "From the node"
+IMPORT_DIR = MOUNT_POINT / "To the node 1"
+EXPORT_DIR = MOUNT_POINT / "From the node 1"
 CONFIG_REMOTE = IMPORT_DIR / "config.ini"
 CONFIG_LOCAL = Path("/home/amin/bn15/config.ini")
 
@@ -50,7 +50,7 @@ TERMINALS = [
 ]
 
 # ---- Power log publish locations on Drive ----
-POWERLOG_REMOTE_BASE = "From the node/Power Logs"
+POWERLOG_REMOTE_BASE = "From the node 1/Power Logs"
 RAW_SUBDIR = POWERLOG_REMOTE_BASE + "/raw"
 
 # ----------------------------------------------------------
@@ -103,17 +103,43 @@ def ensure_mount(timeout_s: float = 12.0) -> bool:
     return _is_mounted(MOUNT_POINT)
 
 def fetch_remote_config() -> bool:
-    if not ensure_mount():
-        return False
-    if CONFIG_REMOTE.exists():
-        CONFIG_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+    # 1) Prefer direct rclone → bypass FUSE
+    if _have_rclone():
         try:
-            shutil.copy2(CONFIG_REMOTE, CONFIG_LOCAL)
-            return True
+            remote_path = f"{RCLONE_REMOTE}:To the node 1/config.ini"
+            res = subprocess.run(
+                [RCLONE, "copyto", remote_path, str(CONFIG_LOCAL)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if res.returncode == 0:
+                print(f"[{now()}] DEBUG: rclone copyto config.ini succeeded.")
+                return True
+            else:
+                print(f"[{now()}] DEBUG: rclone copyto failed rc={res.returncode}")
         except Exception as e:
-            print(f"[{now()}] ⚠️ Failed to copy config: {e}")
-            return False
+            print(f"[{now()}] DEBUG: rclone copyto raised {e!r}")
+
+    # 2) Fallback: try the mounted path (best-effort)
+    if not ensure_mount():
+        print(f"[{now()}] DEBUG: ensure_mount() failed inside fetch_remote_config")
+        return False
+
+    print(f"[{now()}] DEBUG: checking CONFIG_REMOTE={CONFIG_REMOTE}")
+    try:
+        if CONFIG_REMOTE.exists():
+            CONFIG_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(CONFIG_REMOTE, CONFIG_LOCAL)
+            print(f"[{now()}] DEBUG: copy2 via mount succeeded.")
+            return True
+        else:
+            print(f"[{now()}] DEBUG: CONFIG_REMOTE does not exist at init time.")
+    except Exception as e:
+        print(f"[{now()}] ⚠️ Failed to copy config via mount: {e}")
     return False
+
+
 # -------------------------------------------------------------
 
 # -------------------- Config / INI ---------------------------
@@ -137,6 +163,8 @@ def as_bool(s, default=False):
         return default
     return str(s).strip().lower() in ("1", "true", "yes", "on", "y")
 # -------------------------------------------------------------
+
+
 
 # ---------------- Timetable parsing + remap ------------------
 def _parse_tt_block(text: str):
@@ -221,7 +249,7 @@ def remap_and_write_csv(cfg):
     return csv_out
 # -------------------------------------------------------------
 
-# ----------------------------- UI ----------------------------
+# ----------------------------- UI ----------------------   ------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -233,6 +261,7 @@ class App(tk.Tk):
         self.last_session_log: Path | None = None
         self._done_monitor_thread = None
         self._closing = False
+    
 
         # UI
         top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=8)
@@ -259,6 +288,42 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _upload_export_pair(self) -> bool:
+        """
+        Upload contents of /home/amin/bn15/export into 'From the node 1'
+        on the mounted gdrive. Returns True on success.
+        """
+        if not EXPORT_LOCAL.exists() or not any(EXPORT_LOCAL.iterdir()):
+            self.logln(f"[{now()}] export/ is empty; nothing to upload.")
+            return True  # nothing to do is not a hard failure
+
+        # Log what we are about to send
+        try:
+            files = [p.name for p in EXPORT_LOCAL.iterdir() if p.is_file()]
+            self.logln(f"[{now()}] export/ contains: {', '.join(files) or '(no files)'}")
+        except Exception as e:
+            self.logln(f"[{now()}] Could not list export/: {e}")
+
+        # Use the mounted filesystem explicitly
+        if not ensure_mount():
+            self.logln(f"[{now()}] ❌ Cannot mount gdrive; export upload aborted.")
+            return False
+
+        dst = MOUNT_POINT / "From the node 1"
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.logln(f"[{now()}] ❌ Cannot create remote folder {dst}: {e}")
+            return False
+
+        try:
+            copied = self._mount_copy_dir(EXPORT_LOCAL, dst)
+            self.logln(f"[{now()}] Uploaded {copied} file(s) from export/ to {dst}")
+            return copied > 0
+        except Exception as e:
+            self.logln(f"[{now()}] ❌ export upload exception: {e}")
+            return False
+   
     # ----- Clear leftover done flags on startup -----
     def _clear_stale_done_flags(self):
         """
@@ -389,7 +454,7 @@ class App(tk.Tk):
 
     def _check_updates_and_trigger(self):
         """
-        If 'To the node/update files' contains files:
+        If 'To the node 1/update files' contains files:
           - copy to local cache (/home/amin/bn15/_update_cache),
           - purge that remote folder and drop done.ini there (ack of pickup),
           - launch **the cached updater.py if present**; otherwise BN15/updater.py,
@@ -876,31 +941,31 @@ class App(tk.Tk):
             self.logln(f"[{now()}] No session log available for power history.")
 
         # 1) Upload EXPORT_LOCAL → From the node/
-        remap_file = EXPORT_LOCAL / "remapped_times.csv"
+        remap_file = OUT_DIR / "remapped_times.csv"
         remap_uploaded = False
         if remap_file.exists():
-            remap_subdir = "From the node/Remap"
+            remap_subdir = "From the node 1/Remap"
             self.logln(f"[{now()}] Uploading remapped_times.csv to cloud subfolder {remap_subdir}…")
             remap_uploaded = self._copy_to_cloud(remap_file, remap_subdir)
-        if any(EXPORT_LOCAL.iterdir()):
-            self.logln(f"[{now()}] Uploading export/ to cloud…")
-            if remap_uploaded:
-                for f in EXPORT_LOCAL.glob("remapped_times.csv"):
-                    try:
-                        f.unlink()
-                    except Exception as e:
-                        self.logln(f"[{now()}] Could not remove remapped_times.csv after upload: {e}")
-            ok_export = self._copy_to_cloud(EXPORT_LOCAL, "From the node")
-        else:
-            self.logln(f"[{now()}] export/ is empty; nothing to upload.")
-            ok_export = True  # nothing to do counts as success
+            
+        # Upload export/ (BN + KN master CSVs) into From the node 1
+        self.logln(f"[{now()}] Uploading export/ (BN/KN masters) to From the node 1 …")
+        if remap_uploaded:
+            # keep remap only in its own Remap/ folder
+            for f in EXPORT_LOCAL.glob("remapped_times.csv"):
+                try:
+                    f.unlink()
+                except Exception as e:
+                    self.logln(f"[{now()}] Could not remove remapped_times.csv from export/: {e}")
+        ok_export = self._upload_export_pair()
+
 
         # 2) If sendbackup flag, upload backup + session log to From the node/Backup/<ts>/
         cfg = parse_simple_ini(CONFIG_LOCAL)
         send_backup = as_bool(cfg.get("sendbackup")) or as_bool(cfg.get("backup")) or as_bool(cfg.get("uploadbackup"))
         ok_backup = True
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_remote_subdir = f"From the node/Backup/{ts}"
+        backup_remote_subdir = f"From the node 1/Backup/{ts}"
         if send_backup:
             if BACKUP_LOCAL.exists() and any(BACKUP_LOCAL.iterdir()):
                 self.logln(f"[{now()}] Uploading backup/ to cloud at {backup_remote_subdir} …")
@@ -920,7 +985,22 @@ class App(tk.Tk):
                 except Exception as e:
                     self.logln(f"[{now()}] Could not upload session log to backup area: {e}")
 
+                try:
+                    if EXPORT_LOCAL.exists() and any(EXPORT_LOCAL.iterdir()):
+                        self.logln(f"[{now()}] Adding BN/KN master CSVs to backup folder {backup_remote_subdir} …")
+                        if ensure_mount():
+                            dst = MOUNT_POINT / backup_remote_subdir
+                            dst.mkdir(parents=True, exist_ok=True)
+                            copied = self._mount_copy_dir(EXPORT_LOCAL, dst)
+                            self.logln(f"[{now()}] Copied {copied} export file(s) into backup folder.")
+                        else:
+                            self.logln(f"[{now()}] ❌ Could not mount Drive; export files NOT copied to backup.")
+                    else:
+                        self.logln(f"[{now()}] export/ empty → no BN/KN files to include in backup.")
+                except Exception as e:
+                    self.logln(f"[{now()}] Exception while copying export files to backup: {e}")
         # 3) On successful cloud copies, clear local export, out, backup
+
         if ok_export and ok_backup:
             self._safe_clear_contents(EXPORT_LOCAL)
             self._safe_clear_contents(PROCESS_OUT_DIR)  # includes backup inside
